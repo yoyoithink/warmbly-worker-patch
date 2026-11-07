@@ -1,0 +1,212 @@
+diff --git a/internal/client/smtpimap/imap/folders.go b/internal/client/smtpimap/imap/folders.go
+--- a/internal/client/smtpimap/imap/folders.go
++++ b/internal/client/smtpimap/imap/folders.go
+@@ -50,6 +50,19 @@
+ 	if err := c.ensureConnected(); err != nil {
+ 		return FolderListing{}, err
+ 	}
++	var pending []int
++	listing, err := c.listFoldersOnce(limit, &pending)
++	if err != nil || len(pending) == 0 {
++		return listing, err
++	}
++	return c.fillUnmatchedStatus(listing, pending)
++}
++
++// listFoldersOnce is the listing every server gets: LIST, then a STATUS for
++// each folder the LIST did not already answer. A folder whose STATUS reply the
++// client cannot pair with the request is appended without cursors, and its
++// index in the listing goes into pending for fillUnmatchedStatus.
++func (c *Client) listFoldersOnce(limit int, pending *[]int) (FolderListing, *errx.MailError) {
+ 	c.lifecycle.RLock()
+ 	defer c.lifecycle.RUnlock()
+ 	defer c.begin()()
+@@ -114,6 +127,15 @@
+ 			}
+ 			st = data
+ 		}
++		if unmatchedStatus(st) {
++			// A server that answers STATUS under another spelling of the folder
++			// name (NetEase Enterprise Mail masks a non-ASCII name as "???") has
++			// its reply dropped by the client, which pairs replies with commands
++			// by name. The cursors are read from the folder itself instead.
++			*pending = append(*pending, len(resp))
++			resp = append(resp, box)
++			continue
++		}
+ 		if st == nil || st.UIDValidity == 0 || st.UIDNext == 0 {
+ 			return FolderListing{}, errx.ErrMailServerUnreachable
+ 		}
+@@ -129,6 +151,61 @@
+ 	return FolderListing{Folders: resp, Present: present}, nil
+ }
+ 
++// unmatchedStatus is a STATUS result that no reply was paired with. go-imap
++// pairs a reply with its command by mailbox name and drops one it cannot
++// pair, which leaves the zero value; a reply that did arrive always names its
++// mailbox.
++func unmatchedStatus(st *imap.StatusData) bool {
++	return st != nil && st.Mailbox == "" && st.UIDValidity == 0 && st.UIDNext == 0
++}
++
++// fillUnmatchedStatus reads the cursors of the folders whose STATUS reply was
++// not paired, from a read-only SELECT of each. SELECT changes the selected
++// mailbox, so it runs under mu like every other path that does. The lock is
++// taken here and not for the whole listing, so a server that answers STATUS
++// normally keeps the lock-free listing it always had.
++func (c *Client) fillUnmatchedStatus(listing FolderListing, pending []int) (FolderListing, *errx.MailError) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.lifecycle.RLock()
++	defer c.lifecycle.RUnlock()
++	defer c.begin()()
++
++	gone := make(map[int]struct{})
++	for _, i := range pending {
++		box := &listing.Folders[i]
++		sel, err := c.selectMailbox(box.Name, &imap.SelectOptions{ReadOnly: true})
++		if err != nil {
++			merr := c.handleError(err)
++			if merr.Code == errx.ErrMailResourceNotFound.Code {
++				// Only explicit absence can retire a folder's stored state.
++				delete(listing.Present, box.Name)
++				gone[i] = struct{}{}
++				continue
++			}
++			return FolderListing{}, merr
++		}
++		if sel.UIDValidity == 0 || sel.UIDNext == 0 {
++			return FolderListing{}, errx.ErrMailServerUnreachable
++		}
++		box.UIDValidity = sel.UIDValidity
++		box.UIDNext = uint32(sel.UIDNext)
++		box.HighestModSeq = sel.HighestModSeq
++		box.Messages = sel.NumMessages
++	}
++	if len(gone) == 0 {
++		return listing, nil
++	}
++	kept := listing.Folders[:0]
++	for i, box := range listing.Folders {
++		if _, ok := gone[i]; !ok {
++			kept = append(kept, box)
++		}
++	}
++	listing.Folders = kept
++	return listing, nil
++}
++
+ // listOptionsFor is the LIST options a server's capabilities allow, and
+ // whether STATUS was folded into the same round trip.
+ //
+diff --git a/internal/client/smtpimap/imap/folders_masked_status_test.go b/internal/client/smtpimap/imap/folders_masked_status_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/client/smtpimap/imap/folders_masked_status_test.go
+@@ -0,0 +1,106 @@
++package imap
++
++import (
++	"regexp"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"github.com/warmbly/warmbly/internal/models"
++)
++
++// nameInStatus captures the mailbox of a STATUS reply, quoted or bare.
++var nameInStatus = regexp.MustCompile(`^\* STATUS (?:"([^"]*)"|(\S+)) \(`)
++
++// maskNonASCIIStatus stands in for NetEase Enterprise Mail (qiye.163.com),
++// which answers STATUS for a folder with a non-ASCII name under the literal
++// name "???" instead of the name the client asked for. Names travel as
++// modified UTF-7, so the '&' that opens a shift sequence marks a non-ASCII
++// name. Replies are only rewritten while enabled is set.
++func maskNonASCIIStatus(enabled *atomic.Bool) func(string) string {
++	return func(line string) string {
++		if !enabled.Load() {
++			return line
++		}
++		m := nameInStatus.FindStringSubmatch(line)
++		if m == nil {
++			return line
++		}
++		name := m[1]
++		if name == "" {
++			name = m[2]
++		}
++		if !strings.Contains(name, "&") {
++			return line
++		}
++		return nameInStatus.ReplaceAllString(line, `* STATUS "???" (`)
++	}
++}
++
++// A server that names the folder "???" in its STATUS reply used to fail the
++// whole listing as "server unreachable", because go-imap drops a reply it
++// cannot pair with the command and the zero cursors were then refused. The
++// cursors must come out the same as when the server answers normally.
++func TestFoldersSurviveMaskedStatusReplies(t *testing.T) {
++	var mask atomic.Bool
++	c, wire := rewritingServer(t, nil, nil, maskNonASCIIStatus(&mask), "已发送", "已删除", "Templates")
++
++	want, err := c.Folders()
++	if err != nil {
++		t.Fatalf("Folders: %s", err.Message)
++	}
++	if len(want) != 4 {
++		t.Fatalf("got %d folders, want INBOX and three more", len(want))
++	}
++	if n := len(wire.commands("EXAMINE")); n != 0 {
++		t.Fatalf("a listing answered normally sent %d EXAMINE commands, want none", n)
++	}
++
++	mask.Store(true)
++	got, err := c.Folders()
++	if err != nil {
++		t.Fatalf("Folders with masked STATUS replies: %s", err.Message)
++	}
++	if len(got) != len(want) {
++		t.Fatalf("got %d folders with masked replies, want %d", len(got), len(want))
++	}
++	byName := make(map[string]models.Mailbox, len(got))
++	for _, box := range got {
++		byName[box.Name] = box
++	}
++	for _, w := range want {
++		g, ok := byName[w.Name]
++		if !ok {
++			t.Errorf("folder %q missing from the masked listing", w.Name)
++			continue
++		}
++		if g.UIDValidity == 0 || g.UIDNext == 0 {
++			t.Errorf("folder %q has empty cursors %+v", w.Name, g)
++		}
++		if g.UIDValidity != w.UIDValidity || g.UIDNext != w.UIDNext || g.Messages != w.Messages {
++			t.Errorf("folder %q: cursors %+v differ from the normal listing %+v", w.Name, g, w)
++		}
++	}
++	if n := len(wire.commands("EXAMINE")); n != 2 {
++		t.Errorf("sent %d EXAMINE commands, want one for each of the two masked folders", n)
++	}
++}
++
++// Only a reply that went unpaired is read another way: folders whose names
++// survive on the wire never cost an extra command.
++func TestMaskedStatusLeavesAsciiFoldersAlone(t *testing.T) {
++	var mask atomic.Bool
++	mask.Store(true)
++	c, wire := rewritingServer(t, nil, nil, maskNonASCIIStatus(&mask), "Archive", "Templates")
++
++	folders, err := c.Folders()
++	if err != nil {
++		t.Fatalf("Folders: %s", err.Message)
++	}
++	if len(folders) != 3 {
++		t.Fatalf("got %d folders, want INBOX and two more", len(folders))
++	}
++	if n := len(wire.commands("EXAMINE")); n != 0 {
++		t.Fatalf("sent %d EXAMINE commands for an ASCII listing, want none", n)
++	}
++}
