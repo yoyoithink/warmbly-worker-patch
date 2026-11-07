@@ -8,7 +8,7 @@ NetEase answers `STATUS` for non-ASCII folders with the mailbox name masked as `
 
 ## How
 
-- `listFoldersCapped` is split: `listFoldersOnce` is the previous body (LIST, then STATUS per folder). A STATUS result that is the zero value with an empty `Mailbox` (`unmatchedStatus`) is no longer an error: the folder is kept and recorded as pending.
+- `listFoldersCapped` is split: `listFoldersOnce` is the previous body (LIST, then STATUS per folder). A STATUS result that is the zero value with an empty `Mailbox` (`unmatchedStatus`) for a folder whose name contains a non-ASCII character (`nonASCIIName`) is no longer an error: the folder is kept and recorded as pending. An ASCII name cannot be masked this way, so an empty answer for one still fails as before; `TestFoldersIncompleteStatusRemainsRetryable` keeps passing unchanged.
 - `fillUnmatchedStatus` then reads the cursors of the pending folders with a read-only SELECT (EXAMINE) through the existing `selectMailbox` funnel, under `c.mu` → `lifecycle.RLock` → `begin()`, the same order every other selection-changing path uses. The lock is taken only on this path, so servers that answer STATUS correctly keep the lock-free listing.
 - Error handling mirrors the original block: `ErrMailResourceNotFound` retires the folder, anything else aborts. A SELECT that still yields zero cursors returns `ErrMailServerUnreachable` as before, so a genuinely broken server fails the same way.
 - `ListFolders` runs right after `ReleaseMailbox` in the sync loop, so selecting during the listing does not disturb a resumed sync step.
