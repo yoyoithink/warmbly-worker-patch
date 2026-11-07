@@ -21,15 +21,17 @@ diff --git a/internal/client/smtpimap/imap/folders.go b/internal/client/smtpimap
  	c.lifecycle.RLock()
  	defer c.lifecycle.RUnlock()
  	defer c.begin()()
-@@ -114,6 +127,15 @@
+@@ -114,6 +127,17 @@
  			}
  			st = data
  		}
-+		if unmatchedStatus(st) {
-+			// A server that answers STATUS under another spelling of the folder
-+			// name (NetEase Enterprise Mail masks a non-ASCII name as "???") has
-+			// its reply dropped by the client, which pairs replies with commands
-+			// by name. The cursors are read from the folder itself instead.
++		if unmatchedStatus(st) && nonASCIIName(box.Name) {
++			// A server that answers STATUS under another spelling of a non-ASCII
++			// folder name (NetEase Enterprise Mail masks it as "???") has its
++			// reply dropped by the client, which pairs replies with commands by
++			// name. The cursors are read from the folder itself instead. An ASCII
++			// name cannot be masked this way, so an empty answer for one stays the
++			// retryable failure it always was.
 +			*pending = append(*pending, len(resp))
 +			resp = append(resp, box)
 +			continue
@@ -37,7 +39,7 @@ diff --git a/internal/client/smtpimap/imap/folders.go b/internal/client/smtpimap
  		if st == nil || st.UIDValidity == 0 || st.UIDNext == 0 {
  			return FolderListing{}, errx.ErrMailServerUnreachable
  		}
-@@ -129,6 +151,61 @@
+@@ -129,6 +153,72 @@
  	return FolderListing{Folders: resp, Present: present}, nil
  }
  
@@ -47,6 +49,17 @@ diff --git a/internal/client/smtpimap/imap/folders.go b/internal/client/smtpimap
 +// mailbox.
 +func unmatchedStatus(st *imap.StatusData) bool {
 +	return st != nil && st.Mailbox == "" && st.UIDValidity == 0 && st.UIDNext == 0
++}
++
++// nonASCIIName reports whether a folder name has a character that a server
++// can fail to echo back in a STATUS reply.
++func nonASCIIName(name string) bool {
++	for _, r := range name {
++		if r >= utf8.RuneSelf {
++			return true
++		}
++	}
++	return false
 +}
 +
 +// fillUnmatchedStatus reads the cursors of the folders whose STATUS reply was
